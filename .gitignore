@@ -1,0 +1,10 @@
+# 성적·학생 기록이 든 로컬 DB (개인정보) 와 업로드 원본은 올리지 않는다
+data/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+screens/
+
+# 시험지(data/papers)를 저장소에 올리고 싶지 않다면 아래 줄의 # 을 지우세요.
+# 대신 Neon 같은 외부 DB를 쓰고, DATABASE_URL 을 secrets 에 넣으면 됩니다.
+# data/papers/
