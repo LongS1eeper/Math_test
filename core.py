@@ -105,9 +105,8 @@ class DB:
             import psycopg2
             import psycopg2.extras
             self._psycopg2 = psycopg2
-            self.conn = psycopg2.connect(self.url, sslmode="require")
-            self.conn.autocommit = True
             self._factory = psycopg2.extras.RealDictCursor
+            self._connect()
             schema = SCHEMA.replace("{ID}", "SERIAL PRIMARY KEY").replace("{BLOB}", "BYTEA")
         else:
             DATA.mkdir(parents=True, exist_ok=True)
@@ -131,6 +130,55 @@ class DB:
             self.exec(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
     # -- 내부
+    def _connect(self):
+        """Postgres 접속을 새로 연다."""
+        self.conn = self._psycopg2.connect(
+            self.url,
+            sslmode="require",
+            connect_timeout=10,
+            keepalives=1, keepalives_idle=30,
+            keepalives_interval=10, keepalives_count=3,
+        )
+        self.conn.autocommit = True
+
+    def _dead(self, e: Exception) -> bool:
+        """Neon 이 잠들어 접속이 끊긴 경우인가?"""
+        if not self.pg:
+            return False
+        p = self._psycopg2
+        if not isinstance(e, (p.InterfaceError, p.OperationalError)):
+            return False
+        return True
+
+    def _reconnect(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        self._connect()
+
+    def _run(self, sql: str, params, mode: str):
+        """끊긴 접속이면 한 번 다시 연결하고 재시도한다."""
+        for attempt in (0, 1):
+            try:
+                cur = self._cur()
+                cur.execute(self._prep(sql), tuple(params))
+                if mode == "rows":
+                    out = [self._row(r) for r in cur.fetchall()]
+                elif mode == "newid":
+                    out = int(cur.fetchone()["id"] if self.pg else cur.lastrowid)
+                else:
+                    out = None
+                if not self.pg and mode != "rows":
+                    self.conn.commit()
+                cur.close()
+                return out
+            except Exception as e:
+                if attempt == 0 and self._dead(e):
+                    self._reconnect()
+                    continue
+                raise
+
     def _cur(self):
         return self.conn.cursor(cursor_factory=self._factory) if self.pg \
             else self.conn.cursor()
@@ -148,18 +196,10 @@ class DB:
 
     # -- 공개
     def exec(self, sql: str, params=()) -> None:
-        cur = self._cur()
-        cur.execute(self._prep(sql), tuple(params))
-        if not self.pg:
-            self.conn.commit()
-        cur.close()
+        self._run(sql, params, "none")
 
     def query(self, sql: str, params=()) -> List[Dict[str, Any]]:
-        cur = self._cur()
-        cur.execute(self._prep(sql), tuple(params))
-        rows = [self._row(r) for r in cur.fetchall()]
-        cur.close()
-        return rows
+        return self._run(sql, params, "rows")
 
     def one(self, sql: str, params=()) -> Optional[Dict[str, Any]]:
         r = self.query(sql, params)
@@ -167,16 +207,7 @@ class DB:
 
     def insert_id(self, sql: str, params=()) -> int:
         """INSERT 후 새 id 반환. sql 끝에 RETURNING 을 붙이지 말 것."""
-        cur = self._cur()
-        if self.pg:
-            cur.execute(self._prep(sql) + " RETURNING id", tuple(params))
-            new = cur.fetchone()["id"]
-        else:
-            cur.execute(sql, tuple(params))
-            self.conn.commit()
-            new = cur.lastrowid
-        cur.close()
-        return int(new)
+        return self._run(sql + (" RETURNING id" if self.pg else ""), params, "newid")
 
     @property
     def kind(self) -> str:
@@ -257,6 +288,27 @@ def put_paper(meta: dict, questions: List[dict], files: List[tuple]):
     for kind, no, idx, png in files:
         d.exec("INSERT INTO paper_files(code,kind,no,idx,png) VALUES(?,?,?,?,?)",
                (code, kind, no, idx, _blob(png)))
+
+
+def merge_answers(code: str, updates: List[dict], a_files: List[tuple]) -> int:
+    """기존 시험지에 정답·해설만 덧입힌다 (문제 이미지는 그대로 둔다)."""
+    d = db()
+    d.exec("DELETE FROM paper_files WHERE code=? AND kind='a'", (code,))
+    for kind, no, idx, png in a_files:
+        d.exec("INSERT INTO paper_files(code,kind,no,idx,png) VALUES(?,?,?,?,?)",
+               (code, kind, no, idx, _blob(png)))
+    n = 0
+    have = {q["no"] for q in load_paper(code)[1]}
+    for u in updates:
+        if u["no"] not in have:
+            continue
+        d.exec("UPDATE questions SET qtype=?, answer=?, unit=?, needs_check=? "
+               "WHERE code=? AND no=?",
+               (u["qtype"], u["answer"], u.get("unit", ""),
+                1 if u.get("needs_check") else 0, code, u["no"]))
+        n += 1
+    d.exec("UPDATE papers SET updated_at=? WHERE code=?", (now(), code))
+    return n
 
 
 def _blob(b: bytes):
